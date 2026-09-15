@@ -12,30 +12,32 @@ import (
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 )
 
-// SPIRESource is the deployment-time identity source. It holds an open stream
-// to the local SPIRE agent's Workload API and republishes a rotation event
-// whenever the agent pushes a new SVID.
+// SPIRESource is the deployment identity: SVIDs streamed from the SPIRE agent
+// running on the same node, refreshed by the agent before they expire.
 //
-// Note on status: this type compiles and is wired into the same Source
-// interface as Static, but it has not yet been exercised against a live SPIRE
-// server. Standing up SPIRE is scheduled work. Everything demonstrated today
-// runs on Static.
+// The workload never reads a key from disk. There is no secret to mount, no
+// certificate to renew by hand, and nothing to leak in an image layer. The
+// agent decides what this process is by attesting it, then hands over a
+// matching SVID.
+//
+// Status for the review: this compiles and satisfies the same Source interface,
+// but it has not been run against a live SPIRE server yet. Today's demo and
+// tests use StaticSource.
 type SPIRESource struct {
-	source *workloadapi.X509Source
+	spire *workloadapi.X509Source
 
 	rotations chan struct{}
 	stop      chan struct{}
 	closeOnce sync.Once
 }
 
-// NewSPIRESource connects to the SPIRE agent listening on socketPath, for
-// example "unix:///run/spire/sockets/agent.sock".
+// NewSPIRESource connects to the agent's Unix socket, for example
+// unix:///run/spire/sockets/agent.sock.
 //
-// Startup is fail closed. If no SVID arrives within startupTimeout the
-// constructor returns an error and the caller does not begin serving. A grace
-// period was considered and rejected: a service that accepts unauthenticated
-// traffic for thirty seconds after a node restart is precisely the gap this
-// library exists to close.
+// Fail closed: no SVID inside startupTimeout means an error, and the caller
+// never starts serving. A grace period was considered and rejected. A service
+// that accepts unauthenticated traffic for thirty seconds after a node restart
+// is the exact hole this library exists to close.
 func NewSPIRESource(ctx context.Context, socketPath string, startupTimeout time.Duration) (*SPIRESource, error) {
 	if socketPath == "" {
 		return nil, errors.New("identity: no Workload API socket path")
@@ -46,45 +48,46 @@ func NewSPIRESource(ctx context.Context, socketPath string, startupTimeout time.
 	ctx, cancel := context.WithTimeout(ctx, startupTimeout)
 	defer cancel()
 
-	src, err := workloadapi.NewX509Source(ctx,
+	spire, err := workloadapi.NewX509Source(ctx,
 		workloadapi.WithClientOptions(workloadapi.WithAddr(socketPath)))
 	if err != nil {
 		return nil, fmt.Errorf("identity: workload API at %s: %w", socketPath, err)
 	}
-	if _, err := src.GetX509SVID(); err != nil {
-		src.Close()
+	// Connecting is not enough. Prove an SVID actually arrived.
+	if _, err := spire.GetX509SVID(); err != nil {
+		spire.Close()
 		return nil, fmt.Errorf("identity: no SVID from the workload API: %w", err)
 	}
 
-	s := &SPIRESource{
-		source:    src,
+	source := &SPIRESource{
+		spire:     spire,
 		rotations: make(chan struct{}, 1),
 		stop:      make(chan struct{}),
 	}
-	go s.watch()
-	return s, nil
+	go source.watchForRotations()
+	return source, nil
 }
 
-// watch translates the go-spiffe update signal into our rotation event. The
-// two are kept separate so that the rest of the library never imports go-spiffe.
-func (s *SPIRESource) watch() {
-	updated := s.source.Updated()
+// watchForRotations translates go-spiffe's update signal into our own event, so
+// that no other package in the library has to import go-spiffe.
+func (s *SPIRESource) watchForRotations() {
+	updated := s.spire.Updated()
 	for {
 		select {
 		case <-s.stop:
 			return
 		case <-updated:
-			updated = s.source.Updated() // the channel is single use, so re-arm
+			updated = s.spire.Updated() // single-use channel, re-arm it
 			select {
 			case s.rotations <- struct{}{}:
-			default:
+			default: // an unread event is already pending
 			}
 		}
 	}
 }
 
 func (s *SPIRESource) SPIFFEID() string {
-	svid, err := s.source.GetX509SVID()
+	svid, err := s.spire.GetX509SVID()
 	if err != nil {
 		return ""
 	}
@@ -92,27 +95,27 @@ func (s *SPIRESource) SPIFFEID() string {
 }
 
 func (s *SPIRESource) TLSCertificate() (*tls.Certificate, error) {
-	svid, err := s.source.GetX509SVID()
+	svid, err := s.spire.GetX509SVID()
 	if err != nil {
 		return nil, err
 	}
-	der := make([][]byte, 0, len(svid.Certificates))
-	for _, c := range svid.Certificates {
-		der = append(der, c.Raw)
+	rawChain := make([][]byte, 0, len(svid.Certificates))
+	for _, cert := range svid.Certificates {
+		rawChain = append(rawChain, cert.Raw)
 	}
 	return &tls.Certificate{
-		Certificate: der,
+		Certificate: rawChain,
 		PrivateKey:  svid.PrivateKey,
 		Leaf:        svid.Certificates[0],
 	}, nil
 }
 
-func (s *SPIRESource) Roots() []*x509.Certificate {
-	svid, err := s.source.GetX509SVID()
+func (s *SPIRESource) TrustBundle() []*x509.Certificate {
+	svid, err := s.spire.GetX509SVID()
 	if err != nil {
 		return nil
 	}
-	bundle, err := s.source.GetX509BundleForTrustDomain(svid.ID.TrustDomain())
+	bundle, err := s.spire.GetX509BundleForTrustDomain(svid.ID.TrustDomain())
 	if err != nil {
 		return nil
 	}
@@ -125,7 +128,7 @@ func (s *SPIRESource) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		close(s.stop)
-		err = s.source.Close()
+		err = s.spire.Close()
 	})
 	return err
 }

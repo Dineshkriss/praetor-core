@@ -69,7 +69,7 @@ shape this needs.
 type Authorizer func(peerID string) error
 ```
 
-Today that is `AllowID` doing a name comparison. Pillar 3 replaces the body with
+Today that is `AllowOnly` doing a name comparison. Pillar 3 replaces the body with
 a policy evaluation. Nothing around it changes, which is the reason the seam was
 put there now rather than later.
 

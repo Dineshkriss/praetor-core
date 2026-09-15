@@ -33,18 +33,18 @@ claims.
 
 ```go
 // Deployment: identity comes from the local SPIRE agent.
-src, err := identity.NewSPIRESource(ctx, "unix:///run/spire/sockets/agent.sock", 30*time.Second)
-defer src.Close()
+self, err := identity.NewSPIRESource(ctx, "unix:///run/spire/sockets/agent.sock", 30*time.Second)
+defer self.Close()
 
 // Serve. Callers must present a valid SVID from the trust bundle.
-srv, err := transport.NewServer(":8443", handler, src, transport.AllowAnyInBundle())
-srv.ServeTLS(ln, "", "")   // no cert files: they come from src
+srv, err := transport.NewServer(":8443", handler, self, transport.AllowAnyTrustedPeer())
+srv.ServeTLS(listener, "", "")   // no cert files: they come from self
 
 // Inside a handler, the caller's identity is already proven.
 peer, ok := transport.PeerID(r)
 
 // Call out, refusing to talk to anything but the intended service.
-client, err := transport.ClientTo(src, "spiffe://corp.example/ns/prod/sa/orders")
+client, err := transport.ClientTo(self, "spiffe://corp.example/ns/prod/sa/orders")
 ```
 
 ## Documentation

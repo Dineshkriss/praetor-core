@@ -45,10 +45,14 @@ cmd/demo/        four calls against one service: one allowed, three blocked
 ```
 
 About 670 lines of Go, plus a 200 line demo and 350 lines of tests. The
-dependency list is one entry,
-`go-spiffe`, and it is used only by `spire.go`. Everything else is the standard
-library, which keeps the trust decisions in code that can be read in an
-afternoon.
+dependency list is one entry, `go-spiffe`, and it is used only by `spire.go`.
+Everything else is the standard library, which keeps the trust decisions in code
+that can be read in an afternoon.
+
+Two names to keep straight while reading the code. **self** is this workload's
+own identity, the one we present. **peer** is whoever is at the other end, the
+one we verify. Every connection does both, and both sides run the same code, so
+the pair appears throughout.
 
 ## 3. The central abstraction
 
@@ -58,7 +62,7 @@ Everything hangs off one interface in `identity/identity.go`:
 type Source interface {
     SPIFFEID() string
     TLSCertificate() (*tls.Certificate, error)
-    Roots() []*x509.Certificate
+    TrustBundle() []*x509.Certificate
     Rotations() <-chan struct{}
     Close() error
 }
@@ -66,8 +70,8 @@ type Source interface {
 
 Two implementations satisfy it:
 
-- `identity.Static` holds one key pair in memory. The tests and the demo use it,
-  because they have to run on a laptop with no SPIRE agent.
+- `identity.StaticSource` holds one key pair in memory. The tests and the demo
+  use it, because they have to run on a laptop with no SPIRE agent.
 - `identity.SPIRESource` streams SVIDs from a local SPIRE agent over the
   Workload API. This is the deployment path.
 
@@ -126,7 +130,7 @@ anyone using the library.
 ```
   gateway                                                      orders
   -------                                                      ------
-  transport.ClientTo(src, ordersID)
+  transport.ClientTo(self, ordersID)
         |
         |--- TLS 1.3 ClientHello ----------------------------------->
         |
@@ -186,7 +190,7 @@ and still refuses to send the request, because it is not the service it asked
 for.
 
 **Authorization is a one-line seam.** `transport.Authorizer` is
-`func(peerID string) error`. Today it is `AllowAnyInBundle` or `AllowID`.
+`func(peerID string) error`. Today it is `AllowAnyTrustedPeer` or `AllowOnly`.
 This is deliberately the shape that pillar 3 needs: OPA replaces the body of
 that function and nothing around it changes.
 
@@ -234,7 +238,7 @@ rotation. The suite is race clean.
 
 - The SPIRE source compiles and is wired to the same interface, but it has not
   yet been run against a live SPIRE server. Standing up SPIRE is scheduled work.
-  Everything demonstrated today runs on `identity.Static` and the dev CA.
+  Everything demonstrated today runs on `identity.StaticSource` and the dev CA.
 - `internal/devca` performs no attestation. It is a signing stand-in for tests
   and the demo, nothing more.
 - No performance numbers are claimed in this repository. The comparison against

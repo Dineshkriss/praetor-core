@@ -1,10 +1,13 @@
-// Package devca issues SPIFFE-compatible X.509 SVIDs in process, so the
-// library can be tested and demonstrated on a laptop with no SPIRE deployment.
+// Package devca is a stand-in for the part of SPIRE that signs certificates,
+// so tests and the demo run on a laptop with nothing installed.
 //
-// It stands in for the part of SPIRE that signs certificates, and for nothing
-// else: there is no attestation here, so it must never be used outside tests
-// and demos. It is internal/ precisely so that it cannot be imported by a
-// consumer of this library.
+// It issues real X.509 certificates with a SPIFFE ID in the URI SAN, the same
+// shape a genuine SVID has, which means the verification code being tested is
+// the real code.
+//
+// What it deliberately does not do is attestation: it signs anything it is
+// asked to sign. That is why it lives under internal/, where nobody using the
+// library can reach it.
 package devca
 
 import (
@@ -18,15 +21,14 @@ import (
 	"time"
 )
 
-// CA signs SVIDs for a single trust domain, the way one SPIRE server would.
+// CA signs SVIDs for one trust domain, the way a SPIRE server would.
 type CA struct {
 	TrustDomain string
-	cert        *x509.Certificate
-	key         *ecdsa.PrivateKey
+	caCert      *x509.Certificate
+	caKey       *ecdsa.PrivateKey
 }
 
-// SVID is a leaf certificate and its private key, as the Workload API would
-// hand them to a workload.
+// SVID is a certificate and its key, as the Workload API would hand them over.
 type SVID struct {
 	SPIFFEID string
 	Chain    []*x509.Certificate
@@ -35,91 +37,94 @@ type SVID struct {
 
 // New creates a CA for a trust domain such as "corp.example".
 func New(trustDomain string) (*CA, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
 	}
 	now := time.Now()
-	tmpl := &x509.Certificate{
-		SerialNumber:          serial(),
+	template := &x509.Certificate{
+		SerialNumber:          randomSerial(),
 		Subject:               pkix.Name{CommonName: trustDomain + " dev CA"},
-		NotBefore:             now.Add(-time.Minute),
+		NotBefore:             now.Add(-time.Minute), // tolerate small clock skew
 		NotAfter:              now.Add(24 * time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		URIs:                  []*url.URL{mustURL("spiffe://" + trustDomain)},
 	}
-	cert, err := selfSign(tmpl, key)
+	caCert, err := sign(template, template, &caKey.PublicKey, caKey) // self-signed
 	if err != nil {
 		return nil, err
 	}
-	return &CA{TrustDomain: trustDomain, cert: cert, key: key}, nil
+	return &CA{TrustDomain: trustDomain, caCert: caCert, caKey: caKey}, nil
 }
 
-// Roots is the trust bundle for this CA.
-func (c *CA) Roots() []*x509.Certificate { return []*x509.Certificate{c.cert} }
+// TrustBundle is what a peer needs in order to verify SVIDs from this CA.
+func (ca *CA) TrustBundle() []*x509.Certificate { return []*x509.Certificate{ca.caCert} }
 
-// Issue mints an SVID for a path such as "/ns/prod/sa/orders". The one hour
-// lifetime matches the SPIRE default and is short on purpose: it is what makes
-// rotation a normal event rather than an incident.
-func (c *CA) Issue(path string) (*SVID, error) { return c.IssueFor(path, time.Hour) }
+// Issue mints an SVID for a path such as "/ns/prod/sa/orders".
+//
+// One hour matches the SPIRE default. Short lifetimes are the point: they are
+// what make rotation a routine event instead of an incident.
+func (ca *CA) Issue(path string) (*SVID, error) { return ca.IssueFor(path, time.Hour) }
 
-// IssueFor mints an SVID with an explicit lifetime, which the rotation test
-// needs in order to produce two distinct certificates for one identity.
-func (c *CA) IssueFor(path string, ttl time.Duration) (*SVID, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+// IssueFor mints an SVID with an explicit lifetime. The rotation test needs it
+// to produce two different certificates for one identity.
+func (ca *CA) IssueFor(path string, lifetime time.Duration) (*SVID, error) {
+	workloadKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
 	}
-	id := "spiffe://" + c.TrustDomain + path
+	spiffeID := "spiffe://" + ca.TrustDomain + path
 	now := time.Now()
-	tmpl := &x509.Certificate{
-		SerialNumber: serial(),
-		Subject:      pkix.Name{}, // an SVID carries identity in the URI SAN, not here
+	template := &x509.Certificate{
+		SerialNumber: randomSerial(),
+		Subject:      pkix.Name{}, // empty on purpose: identity lives in the URI SAN
 		NotBefore:    now.Add(-time.Minute),
-		NotAfter:     now.Add(ttl),
+		NotAfter:     now.Add(lifetime),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
-		// Both usages: every workload is a client on one connection and a
-		// server on the next.
+		// Both usages, because every workload is a client on one connection
+		// and a server on the next.
 		ExtKeyUsage: []x509.ExtKeyUsage{
 			x509.ExtKeyUsageServerAuth,
 			x509.ExtKeyUsageClientAuth,
 		},
 		BasicConstraintsValid: true,
-		URIs:                  []*url.URL{mustURL(id)},
+		URIs:                  []*url.URL{mustURL(spiffeID)},
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, c.cert, &key.PublicKey, c.key)
+	leafCert, err := sign(template, ca.caCert, &workloadKey.PublicKey, ca.caKey)
 	if err != nil {
 		return nil, err
 	}
-	cert, err := x509.ParseCertificate(der)
+	return &SVID{
+		SPIFFEID: spiffeID,
+		Chain:    []*x509.Certificate{leafCert},
+		Key:      workloadKey,
+	}, nil
+}
+
+// sign creates a certificate from template, signed by issuer.
+func sign(template, issuer *x509.Certificate, subjectKey *ecdsa.PublicKey, issuerKey *ecdsa.PrivateKey) (*x509.Certificate, error) {
+	certDER, err := x509.CreateCertificate(rand.Reader, template, issuer, subjectKey, issuerKey)
 	if err != nil {
 		return nil, err
 	}
-	return &SVID{SPIFFEID: id, Chain: []*x509.Certificate{cert}, Key: key}, nil
+	return x509.ParseCertificate(certDER)
 }
 
-func selfSign(tmpl *x509.Certificate, key *ecdsa.PrivateKey) (*x509.Certificate, error) {
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+func randomSerial() *big.Int {
+	maxSerial := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, maxSerial)
 	if err != nil {
-		return nil, err
+		panic(err) // a broken system RNG is not something to carry on through
 	}
-	return x509.ParseCertificate(der)
+	return serial
 }
 
-func serial() *big.Int {
-	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		panic(err) // a failing system RNG is not something to carry on through
-	}
-	return n
-}
-
-func mustURL(s string) *url.URL {
-	u, err := url.Parse(s)
+func mustURL(raw string) *url.URL {
+	parsed, err := url.Parse(raw)
 	if err != nil {
 		panic(err)
 	}
-	return u
+	return parsed
 }

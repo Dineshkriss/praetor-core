@@ -10,28 +10,29 @@ import (
 	"github.com/praetor-auth/praetor-core/internal/devca"
 )
 
-func TestSPIFFEIDOfReadsTheURISAN(t *testing.T) {
-	_, svid := issue(t, "corp.example", "/ns/prod/sa/orders")
+// The identity is read from the URI SAN, not the subject or a hostname.
+func TestSPIFFEIDComesFromTheURISAN(t *testing.T) {
+	_, svid := newCAAndSVID(t, "corp.example", "/ns/prod/sa/orders")
 
-	got, err := identity.SPIFFEIDOf(svid.Chain[0])
+	gotID, err := identity.SPIFFEIDOf(svid.Chain[0])
 	if err != nil {
 		t.Fatalf("SPIFFEIDOf: %v", err)
 	}
-	if want := "spiffe://corp.example/ns/prod/sa/orders"; got != want {
-		t.Errorf("got %q, want %q", got, want)
+	if wantID := "spiffe://corp.example/ns/prod/sa/orders"; gotID != wantID {
+		t.Errorf("got %q, want %q", gotID, wantID)
 	}
 }
 
-// A certificate with no SPIFFE ID, two SPIFFE IDs, or a non-SPIFFE URI is
-// ambiguous about who the peer is. All three are rejected rather than resolved
-// by a guess.
-func TestSPIFFEIDOfRejectsMalformedCertificates(t *testing.T) {
-	cases := map[string][]*url.URL{
+// Zero SPIFFE IDs names nobody, two names several with no rule for picking,
+// and a non-SPIFFE URI is not an identity at all. Guessing here would mean
+// guessing who the caller is, so all three are refused.
+func TestMalformedCertificatesAreRefused(t *testing.T) {
+	malformed := map[string][]*url.URL{
 		"no URI SAN":      nil,
 		"two URI SANs":    {mustURL(t, "spiffe://corp.example/a"), mustURL(t, "spiffe://corp.example/b")},
 		"not a SPIFFE ID": {mustURL(t, "https://corp.example/a")},
 	}
-	for name, uris := range cases {
+	for name, uris := range malformed {
 		t.Run(name, func(t *testing.T) {
 			cert := &x509.Certificate{Subject: pkix.Name{CommonName: "x"}, URIs: uris}
 			if _, err := identity.SPIFFEIDOf(cert); err == nil {
@@ -41,92 +42,95 @@ func TestSPIFFEIDOfRejectsMalformedCertificates(t *testing.T) {
 	}
 }
 
-func TestStaticServesTheCurrentSVID(t *testing.T) {
-	ca, svid := issue(t, "corp.example", "/ns/prod/sa/orders")
-	src, err := identity.NewStatic(svid.Chain, svid.Key, ca.Roots())
+func TestStaticSourceServesTheCurrentSVID(t *testing.T) {
+	ca, svid := newCAAndSVID(t, "corp.example", "/ns/prod/sa/orders")
+	source, err := identity.NewStaticSource(svid.Chain, svid.Key, ca.TrustBundle())
 	if err != nil {
-		t.Fatalf("NewStatic: %v", err)
+		t.Fatalf("NewStaticSource: %v", err)
 	}
-	defer src.Close()
+	defer source.Close()
 
-	if got := src.SPIFFEID(); got != svid.SPIFFEID {
-		t.Errorf("SPIFFEID = %q, want %q", got, svid.SPIFFEID)
+	if gotID := source.SPIFFEID(); gotID != svid.SPIFFEID {
+		t.Errorf("SPIFFEID = %q, want %q", gotID, svid.SPIFFEID)
 	}
-	cert, err := src.TLSCertificate()
+	tlsCert, err := source.TLSCertificate()
 	if err != nil {
 		t.Fatalf("TLSCertificate: %v", err)
 	}
-	if cert.Leaf != svid.Chain[0] {
+	if tlsCert.Leaf != svid.Chain[0] {
 		t.Error("TLSCertificate returned a different leaf than the one supplied")
 	}
 }
 
-// Callers must not be able to edit the trust bundle out from under the source.
-func TestStaticRootsAreCopied(t *testing.T) {
-	ca, svid := issue(t, "corp.example", "/ns/prod/sa/orders")
-	src, err := identity.NewStatic(svid.Chain, svid.Key, ca.Roots())
+// A caller must not be able to edit our trust anchors by holding onto the
+// slice we handed back.
+func TestTrustBundleIsCopiedNotShared(t *testing.T) {
+	ca, svid := newCAAndSVID(t, "corp.example", "/ns/prod/sa/orders")
+	source, err := identity.NewStaticSource(svid.Chain, svid.Key, ca.TrustBundle())
 	if err != nil {
-		t.Fatalf("NewStatic: %v", err)
+		t.Fatalf("NewStaticSource: %v", err)
 	}
-	defer src.Close()
+	defer source.Close()
 
-	roots := src.Roots()
-	roots[0] = nil
-	if src.Roots()[0] == nil {
-		t.Fatal("mutating the returned slice changed the source's trust bundle")
+	handedBack := source.TrustBundle()
+	handedBack[0] = nil
+
+	if source.TrustBundle()[0] == nil {
+		t.Fatal("editing the returned slice changed the source's trust bundle")
 	}
 }
 
-func TestStaticRotatePublishesAnEvent(t *testing.T) {
-	ca, svid := issue(t, "corp.example", "/ns/prod/sa/orders")
-	src, err := identity.NewStatic(svid.Chain, svid.Key, ca.Roots())
+func TestRotateSwapsTheSVIDAndAnnouncesIt(t *testing.T) {
+	ca, svid := newCAAndSVID(t, "corp.example", "/ns/prod/sa/orders")
+	source, err := identity.NewStaticSource(svid.Chain, svid.Key, ca.TrustBundle())
 	if err != nil {
-		t.Fatalf("NewStatic: %v", err)
+		t.Fatalf("NewStaticSource: %v", err)
 	}
-	defer src.Close()
+	defer source.Close()
 
-	next, err := ca.Issue("/ns/prod/sa/orders")
+	renewed, err := ca.Issue("/ns/prod/sa/orders")
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
-	if err := src.Rotate(next.Chain, next.Key); err != nil {
+	if err := source.Rotate(renewed.Chain, renewed.Key); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
 	select {
-	case <-src.Rotations():
+	case <-source.Rotations():
 	default:
 		t.Fatal("no rotation event was published")
 	}
-	cert, err := src.TLSCertificate()
+
+	tlsCert, err := source.TLSCertificate()
 	if err != nil {
 		t.Fatalf("TLSCertificate: %v", err)
 	}
-	if cert.Leaf != next.Chain[0] {
+	if tlsCert.Leaf != renewed.Chain[0] {
 		t.Error("the source is still serving the old SVID")
 	}
 }
 
-// A re-issued certificate for a different identity is not a rotation. Accepting
-// one would let this process quietly start claiming to be another workload.
-func TestStaticRotateRejectsADifferentIdentity(t *testing.T) {
-	ca, svid := issue(t, "corp.example", "/ns/prod/sa/orders")
-	src, err := identity.NewStatic(svid.Chain, svid.Key, ca.Roots())
+// A certificate for a different identity is not a rotation. Accepting one
+// would let this process quietly start impersonating another workload.
+func TestRotateRefusesADifferentIdentity(t *testing.T) {
+	ca, svid := newCAAndSVID(t, "corp.example", "/ns/prod/sa/orders")
+	source, err := identity.NewStaticSource(svid.Chain, svid.Key, ca.TrustBundle())
 	if err != nil {
-		t.Fatalf("NewStatic: %v", err)
+		t.Fatalf("NewStaticSource: %v", err)
 	}
-	defer src.Close()
+	defer source.Close()
 
-	other, err := ca.Issue("/ns/prod/sa/payments")
+	someoneElse, err := ca.Issue("/ns/prod/sa/payments")
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
-	if err := src.Rotate(other.Chain, other.Key); err == nil {
-		t.Fatal("expected Rotate to reject a different SPIFFE ID")
+	if err := source.Rotate(someoneElse.Chain, someoneElse.Key); err == nil {
+		t.Fatal("expected Rotate to refuse a different SPIFFE ID")
 	}
 }
 
-func issue(t *testing.T, trustDomain, path string) (*devca.CA, *devca.SVID) {
+func newCAAndSVID(t *testing.T, trustDomain, path string) (*devca.CA, *devca.SVID) {
 	t.Helper()
 	ca, err := devca.New(trustDomain)
 	if err != nil {
@@ -139,11 +143,11 @@ func issue(t *testing.T, trustDomain, path string) (*devca.CA, *devca.SVID) {
 	return ca, svid
 }
 
-func mustURL(t *testing.T, s string) *url.URL {
+func mustURL(t *testing.T, raw string) *url.URL {
 	t.Helper()
-	u, err := url.Parse(s)
+	parsed, err := url.Parse(raw)
 	if err != nil {
-		t.Fatalf("parse %s: %v", s, err)
+		t.Fatalf("parse %s: %v", raw, err)
 	}
-	return u
+	return parsed
 }

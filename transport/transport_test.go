@@ -19,174 +19,190 @@ const (
 	paymentsID = "spiffe://corp.example/ns/prod/sa/payments"
 )
 
-// The intended path: two workloads in one trust domain, each proving itself to
-// the other, with the handler reading the caller's identity off the connection.
+// The happy path: two workloads in one trust domain prove themselves to each
+// other, and the handler learns the caller's identity from the connection.
 func TestMutualTLSRoundTrip(t *testing.T) {
-	env := newEnv(t)
-	client, err := transport.ClientTo(env.gateway, ordersID)
+	svc := newOrdersService(t)
+
+	gatewayClient, err := transport.ClientTo(svc.gatewayIdentity, ordersID)
 	if err != nil {
 		t.Fatalf("ClientTo: %v", err)
 	}
-
-	body, err := get(client, env.url)
+	body, err := get(gatewayClient, svc.url)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
-	if want := "peer=" + env.gateway.SPIFFEID(); body != want {
+	if want := "caller=" + svc.gatewayIdentity.SPIFFEID(); body != want {
 		t.Errorf("handler saw %q, want %q", body, want)
 	}
 }
 
-// Without a client certificate there is nothing to authenticate, so the
-// handshake has to fail before any handler runs.
-func TestServerRejectsCallerWithoutCertificate(t *testing.T) {
-	env := newEnv(t)
-	if _, err := get(rawClient(t, nil), env.url); err == nil {
+// No certificate means nothing to authenticate, so the handshake must fail
+// before any handler runs.
+func TestCallerWithoutCertificateIsRejected(t *testing.T) {
+	svc := newOrdersService(t)
+
+	if _, err := get(rawClient(t, nil), svc.url); err == nil {
 		t.Fatal("expected the handshake to fail without a client certificate")
 	}
 }
 
-// The rogue SVID is well formed and carries a valid SPIFFE ID. It fails purely
-// because its chain does not terminate in our trust bundle, which is the check
-// that makes a stolen or self-minted certificate useless.
-func TestServerRejectsUntrustedIssuer(t *testing.T) {
-	env := newEnv(t)
-	rogue, err := devca.New("attacker.example")
+// The important negative case. This SVID is genuine and carries a valid SPIFFE
+// ID for a real service path. It fails on one thing only: the wrong issuer.
+func TestCallerFromUntrustedCAIsRejected(t *testing.T) {
+	svc := newOrdersService(t)
+
+	untrustedCA, err := devca.New("attacker.example")
 	if err != nil {
 		t.Fatalf("devca.New: %v", err)
 	}
-	svid, err := rogue.Issue("/ns/prod/sa/gateway")
+	forgedSVID, err := untrustedCA.Issue("/ns/prod/sa/gateway")
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
 
-	cert := &tls.Certificate{Certificate: [][]byte{svid.Chain[0].Raw}, PrivateKey: svid.Key}
-	if _, err := get(rawClient(t, cert), env.url); err == nil {
+	forgedCert := &tls.Certificate{
+		Certificate: [][]byte{forgedSVID.Chain[0].Raw},
+		PrivateKey:  forgedSVID.Key,
+	}
+	if _, err := get(rawClient(t, forgedCert), svc.url); err == nil {
 		t.Fatal("expected an SVID from an untrusted CA to be rejected")
 	}
 }
 
-// Pinning the callee means a trusted but unintended peer is still refused. The
-// server here is perfectly valid, it is simply not the one the caller meant.
-func TestClientRejectsUnexpectedServerIdentity(t *testing.T) {
-	env := newEnv(t)
-	client, err := transport.ClientTo(env.gateway, paymentsID)
+// Naming the callee means a trusted but unintended peer is still refused. The
+// server here is entirely valid, it is just not the one the client asked for.
+func TestClientRejectsTheWrongServerIdentity(t *testing.T) {
+	svc := newOrdersService(t)
+
+	clientExpectingPayments, err := transport.ClientTo(svc.gatewayIdentity, paymentsID)
 	if err != nil {
 		t.Fatalf("ClientTo: %v", err)
 	}
-	if _, err := get(client, env.url); err == nil {
-		t.Fatal("expected the client to reject a server it did not ask for")
+	if _, err := get(clientExpectingPayments, svc.url); err == nil {
+		t.Fatal("expected the client to refuse a server it did not ask for")
 	}
 }
 
-// After rotation the source hands out a new certificate and the client keeps
-// working, which is the property that lets SVIDs stay short lived.
-func TestRotatedSVIDStillHandshakes(t *testing.T) {
-	env := newEnv(t)
-	client, err := transport.ClientTo(env.gateway, ordersID)
+// Calls keep working across a rotation. This is the property that makes short
+// SVID lifetimes practical.
+func TestCallsSurviveAnSVIDRotation(t *testing.T) {
+	svc := newOrdersService(t)
+
+	gatewayClient, err := transport.ClientTo(svc.gatewayIdentity, ordersID)
 	if err != nil {
 		t.Fatalf("ClientTo: %v", err)
 	}
-	if _, err := get(client, env.url); err != nil {
+	if _, err := get(gatewayClient, svc.url); err != nil {
 		t.Fatalf("request before rotation: %v", err)
 	}
 
-	next, err := env.ca.Issue("/ns/prod/sa/gateway")
+	renewed, err := svc.ca.Issue("/ns/prod/sa/gateway")
 	if err != nil {
 		t.Fatalf("issue: %v", err)
 	}
-	if err := env.gateway.Rotate(next.Chain, next.Key); err != nil {
+	if err := svc.gatewayIdentity.Rotate(renewed.Chain, renewed.Key); err != nil {
 		t.Fatalf("Rotate: %v", err)
 	}
 
-	if _, err := get(client, env.url); err != nil {
+	if _, err := get(gatewayClient, svc.url); err != nil {
 		t.Fatalf("request after rotation: %v", err)
 	}
 }
 
-// PeerID must not report an identity for a request that did not arrive over
-// verified mutual TLS, because a handler uses it to decide what to serve.
+// A handler uses PeerID to decide what to serve, so it must never report an
+// identity for a request that did not arrive over verified mutual TLS.
 func TestPeerIDIsAbsentWithoutTLS(t *testing.T) {
-	if id, ok := transport.PeerID(httptest.NewRequest(http.MethodGet, "/orders", nil)); ok {
-		t.Fatalf("expected no peer identity on a plain request, got %q", id)
+	plainRequest := httptest.NewRequest(http.MethodGet, "/orders", nil)
+
+	if callerID, ok := transport.PeerID(plainRequest); ok {
+		t.Fatalf("expected no peer identity on a plain request, got %q", callerID)
 	}
 }
 
-type env struct {
-	ca      *devca.CA
-	gateway *identity.Static
-	url     string
+// ordersService is a running mutual-TLS service plus a gateway identity to call
+// it with, both in one trust domain.
+type ordersService struct {
+	ca              *devca.CA
+	gatewayIdentity *identity.StaticSource
+	url             string
 }
 
-// newEnv brings up an orders server and a gateway identity in one trust domain.
-func newEnv(t *testing.T) *env {
+func newOrdersService(t *testing.T) *ordersService {
 	t.Helper()
 	ca, err := devca.New("corp.example")
 	if err != nil {
 		t.Fatalf("devca.New: %v", err)
 	}
-	orders := source(t, ca, "/ns/prod/sa/orders")
-	gateway := source(t, ca, "/ns/prod/sa/gateway")
+	ordersIdentity := identityFor(t, ca, "/ns/prod/sa/orders")
+	gatewayIdentity := identityFor(t, ca, "/ns/prod/sa/gateway")
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		peer, ok := transport.PeerID(r)
+		callerID, ok := transport.PeerID(r)
 		if !ok {
 			http.Error(w, "no verified peer", http.StatusUnauthorized)
 			return
 		}
-		fmt.Fprintf(w, "peer=%s", peer)
+		fmt.Fprintf(w, "caller=%s", callerID)
 	})
 
-	// A real listener rather than httptest.NewUnstartedServer: httptest injects
-	// its own self-signed certificate into the config, which would then be
-	// served instead of the SVID whenever the client connects without SNI.
-	srv, err := transport.NewServer("", handler, orders, transport.AllowAnyInBundle())
+	server, err := transport.NewServer("", handler, ordersIdentity, transport.AllowAnyTrustedPeer())
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+
+	// A real listener rather than httptest.NewUnstartedServer, which injects
+	// its own self-signed certificate into the config. That certificate would
+	// then be served instead of the SVID whenever a client connects without
+	// SNI, which is exactly what happens when dialling an IP address.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
-	go srv.ServeTLS(ln, "", "")
-	t.Cleanup(func() { srv.Close() })
+	go server.ServeTLS(listener, "", "")
+	t.Cleanup(func() { server.Close() })
 
-	return &env{ca: ca, gateway: gateway, url: "https://" + ln.Addr().String() + "/orders"}
+	return &ordersService{
+		ca:              ca,
+		gatewayIdentity: gatewayIdentity,
+		url:             "https://" + listener.Addr().String() + "/orders",
+	}
 }
 
-func source(t *testing.T, ca *devca.CA, path string) *identity.Static {
+func identityFor(t *testing.T, ca *devca.CA, path string) *identity.StaticSource {
 	t.Helper()
 	svid, err := ca.Issue(path)
 	if err != nil {
 		t.Fatalf("devca issue %s: %v", path, err)
 	}
-	src, err := identity.NewStatic(svid.Chain, svid.Key, ca.Roots())
+	source, err := identity.NewStaticSource(svid.Chain, svid.Key, ca.TrustBundle())
 	if err != nil {
-		t.Fatalf("NewStatic: %v", err)
+		t.Fatalf("NewStaticSource: %v", err)
 	}
-	t.Cleanup(func() { src.Close() })
-	return src
+	t.Cleanup(func() { source.Close() })
+	return source
 }
 
 // rawClient skips server verification so that a failed call is unambiguously
 // the server rejecting this caller.
-func rawClient(t *testing.T, cert *tls.Certificate) *http.Client {
+func rawClient(t *testing.T, clientCert *tls.Certificate) *http.Client {
 	t.Helper()
-	cfg := &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true}
-	if cert != nil {
-		cfg.Certificates = []tls.Certificate{*cert}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true}
+	if clientCert != nil {
+		tlsConfig.Certificates = []tls.Certificate{*clientCert}
 	}
-	rt := &http.Transport{TLSClientConfig: cfg}
-	t.Cleanup(rt.CloseIdleConnections)
-	return &http.Client{Transport: rt}
+	roundTripper := &http.Transport{TLSClientConfig: tlsConfig}
+	t.Cleanup(roundTripper.CloseIdleConnections)
+	return &http.Client{Transport: roundTripper}
 }
 
-func get(c *http.Client, url string) (string, error) {
-	resp, err := c.Get(url)
+func get(client *http.Client, url string) (string, error) {
+	resp, err := client.Get(url)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
