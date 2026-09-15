@@ -1,5 +1,4 @@
-// Command demo issues identities for two sample services and prints them, so
-// you can see what a workload identity actually looks like.
+// Command demo issues identities for two sample services and prints them.
 //
 //	go run ./cmd/demo
 package main
@@ -26,8 +25,8 @@ func main() {
 		len(ca.TrustBundle()), ca.TrustBundle()[0].Subject.CommonName)
 
 	// Two services, each issued its own SVID.
-	for _, path := range []string{"/ns/prod/sa/gateway", "/ns/prod/sa/orders"} {
-		svid, err := ca.Issue(path)
+	for _, servicePath := range []string{"/ns/prod/sa/gateway", "/ns/prod/sa/orders"} {
+		svid, err := ca.Issue(servicePath)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -41,6 +40,7 @@ func main() {
 	}
 }
 
+// describe prints what is actually inside a workload's SVID.
 func describe(source identity.Source) {
 	cert, err := source.TLSCertificate()
 	if err != nil {
@@ -51,8 +51,6 @@ func describe(source identity.Source) {
 	fmt.Printf("\n%s\n", path.Base(source.SPIFFEID()))
 	fmt.Printf("  identity   : %s   (Source.SPIFFEID)\n", source.SPIFFEID())
 	fmt.Printf("  URI SAN    : %s   (read back off the certificate)\n", leaf.URIs[0])
-	// Empty on purpose, and worth pointing at: the identity is the URI SAN
-	// above, never the subject that a normal TLS certificate would use.
 	fmt.Printf("  subject    : %q   (empty: identity does not live here)\n", leaf.Subject.String())
 	fmt.Printf("  issuer     : %s\n", leaf.Issuer.CommonName)
 	fmt.Printf("  serial     : %x\n", leaf.SerialNumber)

@@ -1,14 +1,5 @@
-// Package transport turns a workload identity into mutual TLS, inside the
-// application process.
-//
-// No sidecar. In a service mesh a proxy container sits next to every service
-// and terminates TLS for it. Here the same Go process that runs the handler
-// terminates TLS itself, so there is no extra container, no extra hop, and no
-// gap between what the proxy checked and what the application believes.
-//
-// Two words to keep straight while reading: "self" is this workload's own
-// identity, which we present. "Peer" is whoever is on the other end, which we
-// verify. Both sides of a connection do both things, through the same code.
+// Package transport builds mutual TLS from a workload identity, in process.
+// "self" is our own identity, "peer" is whoever is on the other end.
 package transport
 
 import (
@@ -23,23 +14,14 @@ import (
 	"github.com/praetor-auth/praetor-core/identity"
 )
 
-// Authorizer decides whether a peer we have already authenticated is one we
-// want to talk to.
-//
-// By the time this runs, the peer's certificate is proven genuine. The only
-// question left is "is this the right workload", never "is this real".
-//
-// This is also the extension point for the authorization pillar: OPA replaces
-// the body of this function and nothing around it changes.
+// Authorizer decides whether an authenticated peer is one we want to talk to.
+// Policy evaluation will replace the body of these later.
 type Authorizer func(peerID string) error
 
-// AllowAnyTrustedPeer accepts any workload holding a valid SVID from our trust
-// domain. Right for a service with many callers that decides per request.
+// AllowAnyTrustedPeer accepts any workload with a valid SVID from our bundle.
 func AllowAnyTrustedPeer() Authorizer { return func(string) error { return nil } }
 
-// AllowOnly accepts one named SPIFFE ID and nothing else. Use it on outbound
-// calls: naming the callee costs nothing and stops a DNS change or a hijacked
-// address from quietly routing your request to a different workload.
+// AllowOnly accepts one named SPIFFE ID and nothing else.
 func AllowOnly(expectedID string) Authorizer {
 	return func(actualID string) error {
 		if actualID != expectedID {
@@ -49,7 +31,7 @@ func AllowOnly(expectedID string) Authorizer {
 	}
 }
 
-// ServerTLSConfig demands a valid SVID from every caller.
+// ServerTLSConfig requires a valid SVID from every caller.
 func ServerTLSConfig(self identity.Source, authorize Authorizer) (*tls.Config, error) {
 	if self == nil {
 		return nil, errors.New("transport: no identity source")
@@ -60,19 +42,14 @@ func ServerTLSConfig(self identity.Source, authorize Authorizer) (*tls.Config, e
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13,
 
-		// Reviewer will ask why this is not RequireAndVerifyClientCert.
-		// Answer: that option verifies against a ClientCAs pool frozen when
-		// this config was built, and our trust bundle changes while we run.
-		// So we require a certificate here and verify it ourselves below,
-		// against the bundle read at handshake time. Stricter, not looser.
+		// Not RequireAndVerify: that checks against a ClientCAs pool frozen at
+		// config time. verifyPeer below uses the bundle as it is now.
 		ClientAuth: tls.RequireAnyClientCert,
 
-		// Asked for per handshake, never captured once, so a rotated SVID is
-		// served the moment it arrives.
+		// Fetched per handshake so a rotated SVID is served immediately.
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return self.TLSCertificate()
 		},
-
 		VerifyPeerCertificate: func(rawPeerChain [][]byte, _ [][]*x509.Certificate) error {
 			return verifyPeer(rawPeerChain, self.TrustBundle(), x509.ExtKeyUsageClientAuth, authorize)
 		},
@@ -90,34 +67,20 @@ func ClientTLSConfig(self identity.Source, authorize Authorizer) (*tls.Config, e
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13,
 
-		// The other line a reviewer will stop on. It is not a weakening.
-		//
-		// An SVID has no DNS name in it, so Go's built-in hostname check would
-		// always fail, and even passing it would answer the wrong question:
-		// "does this match the address I dialled" instead of "is this the
-		// workload I meant". This flag turns off that check and only that
-		// check. VerifyPeerCertificate below always runs and does more: full
-		// chain validation plus an exact SPIFFE ID match.
+		// An SVID has no DNS name, so the built-in hostname check cannot apply.
+		// verifyPeer below replaces it with a stricter SPIFFE ID check.
 		InsecureSkipVerify: true,
 
 		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
 			return self.TLSCertificate()
 		},
-
 		VerifyPeerCertificate: func(rawPeerChain [][]byte, _ [][]*x509.Certificate) error {
 			return verifyPeer(rawPeerChain, self.TrustBundle(), x509.ExtKeyUsageServerAuth, authorize)
 		},
 	}, nil
 }
 
-// verifyPeer is the entire trust decision, in one place, used by both sides.
-//
-// Three questions, in order:
-//  1. Does the peer's chain end at a CA we trust?
-//  2. Does its leaf carry one well-formed SPIFFE ID?
-//  3. Does the authorizer accept that ID?
-//
-// Any "no" aborts the handshake, so a rejected caller never reaches a handler.
+// verifyPeer is the trust decision, used by both sides of a connection.
 func verifyPeer(rawPeerChain [][]byte, trustBundle []*x509.Certificate, requiredUsage x509.ExtKeyUsage, authorize Authorizer) error {
 	if len(rawPeerChain) == 0 {
 		return errors.New("transport: peer presented no certificate")
@@ -132,7 +95,7 @@ func verifyPeer(rawPeerChain [][]byte, trustBundle []*x509.Certificate, required
 	}
 	peerLeaf, intermediates := peerChain[0], peerChain[1:]
 
-	// 1. Chain of trust.
+	// Does the chain end at a CA we trust?
 	if _, err := peerLeaf.Verify(x509.VerifyOptions{
 		Roots:         asCertPool(trustBundle),
 		Intermediates: asCertPool(intermediates),
@@ -141,21 +104,16 @@ func verifyPeer(rawPeerChain [][]byte, trustBundle []*x509.Certificate, required
 		return fmt.Errorf("transport: peer SVID does not chain to the trust bundle: %w", err)
 	}
 
-	// 2. Identity.
+	// Who is it, and do we want to talk to them?
 	peerID, err := identity.SPIFFEIDOf(peerLeaf)
 	if err != nil {
 		return fmt.Errorf("transport: %w", err)
 	}
-
-	// 3. Permission to talk to it.
 	return authorize(peerID)
 }
 
-// PeerID is how a handler learns who called it.
-//
-// It reads the leaf the TLS stack already accepted, so the identity is proven
-// before the handler ever runs. A false result means this request did not come
-// over verified mutual TLS and must not be served.
+// PeerID returns the SPIFFE ID of the caller. False means the request did not
+// arrive over verified mutual TLS.
 func PeerID(r *http.Request) (string, bool) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		return "", false
@@ -167,9 +125,8 @@ func PeerID(r *http.Request) (string, bool) {
 	return peerID, true
 }
 
-// NewServer wraps a handler in mutual TLS. Serve it with ServeTLS(listener, "", "):
-// the empty filenames are the point, because the certificate comes from the
-// identity source, not from disk.
+// NewServer wraps a handler in mutual TLS. Serve it with ServeTLS(l, "", ""):
+// the certificate comes from the identity source, not from disk.
 func NewServer(addr string, handler http.Handler, self identity.Source, authorize Authorizer) (*http.Server, error) {
 	tlsConfig, err := ServerTLSConfig(self, authorize)
 	if err != nil {
@@ -184,16 +141,13 @@ func NewServer(addr string, handler http.Handler, self identity.Source, authoriz
 }
 
 // RoundTripper is an HTTP transport over mutual TLS that survives SVID
-// rotation: when the identity changes it drops idle connections so the next
-// request re-handshakes with the new certificate, while requests already in
-// flight finish normally instead of failing mid-response.
+// rotation.
 type RoundTripper struct {
 	inner *http.Transport
 	done  chan struct{}
 	once  sync.Once
 }
 
-// NewRoundTripper builds the outbound transport for one workload.
 func NewRoundTripper(self identity.Source, authorize Authorizer) (*RoundTripper, error) {
 	tlsConfig, err := ClientTLSConfig(self, authorize)
 	if err != nil {
@@ -213,6 +167,8 @@ func NewRoundTripper(self identity.Source, authorize Authorizer) (*RoundTripper,
 	return roundTripper, nil
 }
 
+// watchForRotations drops idle connections on rotation, so the next request
+// re-handshakes with the new SVID while in-flight ones finish on the old.
 func (rt *RoundTripper) watchForRotations(self identity.Source) {
 	rotations := self.Rotations()
 	for {
@@ -221,7 +177,7 @@ func (rt *RoundTripper) watchForRotations(self identity.Source) {
 			return
 		case _, stillOpen := <-rotations:
 			if !stillOpen {
-				return // the identity source was closed
+				return
 			}
 			rt.inner.CloseIdleConnections()
 		}
@@ -232,7 +188,6 @@ func (rt *RoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
 	return rt.inner.RoundTrip(r)
 }
 
-// Close stops watching for rotations and releases pooled connections.
 func (rt *RoundTripper) Close() error {
 	rt.once.Do(func() {
 		close(rt.done)
@@ -241,8 +196,7 @@ func (rt *RoundTripper) Close() error {
 	return nil
 }
 
-// ClientTo returns a client that will only complete a handshake with the named
-// service. Prefer this for service-to-service calls.
+// ClientTo returns a client that will only talk to the named service.
 func ClientTo(self identity.Source, expectedServerID string) (*http.Client, error) {
 	return newClient(self, AllowOnly(expectedServerID))
 }

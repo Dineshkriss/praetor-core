@@ -12,17 +12,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 )
 
-// SPIRESource is the deployment identity: SVIDs streamed from the SPIRE agent
-// running on the same node, refreshed by the agent before they expire.
-//
-// The workload never reads a key from disk. There is no secret to mount, no
-// certificate to renew by hand, and nothing to leak in an image layer. The
-// agent decides what this process is by attesting it, then hands over a
-// matching SVID.
-//
-// Status for the review: this compiles and satisfies the same Source interface,
-// but it has not been run against a live SPIRE server yet. Today's demo and
-// tests use StaticSource.
+// SPIRESource streams SVIDs from the local SPIRE agent. Not yet run against a
+// live SPIRE server.
 type SPIRESource struct {
 	spire *workloadapi.X509Source
 
@@ -31,13 +22,9 @@ type SPIRESource struct {
 	closeOnce sync.Once
 }
 
-// NewSPIRESource connects to the agent's Unix socket, for example
-// unix:///run/spire/sockets/agent.sock.
-//
-// Fail closed: no SVID inside startupTimeout means an error, and the caller
-// never starts serving. A grace period was considered and rejected. A service
-// that accepts unauthenticated traffic for thirty seconds after a node restart
-// is the exact hole this library exists to close.
+// NewSPIRESource connects to the agent socket, for example
+// unix:///run/spire/sockets/agent.sock. It fails if no SVID arrives in time,
+// so a workload without an identity never starts serving.
 func NewSPIRESource(ctx context.Context, socketPath string, startupTimeout time.Duration) (*SPIRESource, error) {
 	if socketPath == "" {
 		return nil, errors.New("identity: no Workload API socket path")
@@ -53,7 +40,6 @@ func NewSPIRESource(ctx context.Context, socketPath string, startupTimeout time.
 	if err != nil {
 		return nil, fmt.Errorf("identity: workload API at %s: %w", socketPath, err)
 	}
-	// Connecting is not enough. Prove an SVID actually arrived.
 	if _, err := spire.GetX509SVID(); err != nil {
 		spire.Close()
 		return nil, fmt.Errorf("identity: no SVID from the workload API: %w", err)
@@ -68,8 +54,8 @@ func NewSPIRESource(ctx context.Context, socketPath string, startupTimeout time.
 	return source, nil
 }
 
-// watchForRotations translates go-spiffe's update signal into our own event, so
-// that no other package in the library has to import go-spiffe.
+// watchForRotations turns go-spiffe update signals into our own events, so no
+// other package has to import go-spiffe.
 func (s *SPIRESource) watchForRotations() {
 	updated := s.spire.Updated()
 	for {
@@ -77,10 +63,10 @@ func (s *SPIRESource) watchForRotations() {
 		case <-s.stop:
 			return
 		case <-updated:
-			updated = s.spire.Updated() // single-use channel, re-arm it
+			updated = s.spire.Updated()
 			select {
 			case s.rotations <- struct{}{}:
-			default: // an unread event is already pending
+			default:
 			}
 		}
 	}

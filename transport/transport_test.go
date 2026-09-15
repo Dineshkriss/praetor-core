@@ -19,8 +19,6 @@ const (
 	paymentsID = "spiffe://corp.example/ns/prod/sa/payments"
 )
 
-// The happy path: two workloads in one trust domain prove themselves to each
-// other, and the handler learns the caller's identity from the connection.
 func TestMutualTLSRoundTrip(t *testing.T) {
 	svc := newOrdersService(t)
 
@@ -37,8 +35,6 @@ func TestMutualTLSRoundTrip(t *testing.T) {
 	}
 }
 
-// No certificate means nothing to authenticate, so the handshake must fail
-// before any handler runs.
 func TestCallerWithoutCertificateIsRejected(t *testing.T) {
 	svc := newOrdersService(t)
 
@@ -47,8 +43,7 @@ func TestCallerWithoutCertificateIsRejected(t *testing.T) {
 	}
 }
 
-// The important negative case. This SVID is genuine and carries a valid SPIFFE
-// ID for a real service path. It fails on one thing only: the wrong issuer.
+// The SVID is genuine and claims a real service path, but the issuer is wrong.
 func TestCallerFromUntrustedCAIsRejected(t *testing.T) {
 	svc := newOrdersService(t)
 
@@ -70,8 +65,6 @@ func TestCallerFromUntrustedCAIsRejected(t *testing.T) {
 	}
 }
 
-// Naming the callee means a trusted but unintended peer is still refused. The
-// server here is entirely valid, it is just not the one the client asked for.
 func TestClientRejectsTheWrongServerIdentity(t *testing.T) {
 	svc := newOrdersService(t)
 
@@ -84,8 +77,6 @@ func TestClientRejectsTheWrongServerIdentity(t *testing.T) {
 	}
 }
 
-// Calls keep working across a rotation. This is the property that makes short
-// SVID lifetimes practical.
 func TestCallsSurviveAnSVIDRotation(t *testing.T) {
 	svc := newOrdersService(t)
 
@@ -110,8 +101,6 @@ func TestCallsSurviveAnSVIDRotation(t *testing.T) {
 	}
 }
 
-// A handler uses PeerID to decide what to serve, so it must never report an
-// identity for a request that did not arrive over verified mutual TLS.
 func TestPeerIDIsAbsentWithoutTLS(t *testing.T) {
 	plainRequest := httptest.NewRequest(http.MethodGet, "/orders", nil)
 
@@ -120,8 +109,7 @@ func TestPeerIDIsAbsentWithoutTLS(t *testing.T) {
 	}
 }
 
-// ordersService is a running mutual-TLS service plus a gateway identity to call
-// it with, both in one trust domain.
+// ordersService is a running mutual-TLS service plus an identity to call it with.
 type ordersService struct {
 	ca              *devca.CA
 	gatewayIdentity *identity.StaticSource
@@ -151,10 +139,8 @@ func newOrdersService(t *testing.T) *ordersService {
 		t.Fatalf("NewServer: %v", err)
 	}
 
-	// A real listener rather than httptest.NewUnstartedServer, which injects
-	// its own self-signed certificate into the config. That certificate would
-	// then be served instead of the SVID whenever a client connects without
-	// SNI, which is exactly what happens when dialling an IP address.
+	// Not httptest.NewUnstartedServer: it injects its own certificate, which
+	// would be served instead of the SVID when a client dials an IP.
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -183,8 +169,7 @@ func identityFor(t *testing.T, ca *devca.CA, path string) *identity.StaticSource
 	return source
 }
 
-// rawClient skips server verification so that a failed call is unambiguously
-// the server rejecting this caller.
+// rawClient skips server verification, so a failure is the server rejecting us.
 func rawClient(t *testing.T, clientCert *tls.Certificate) *http.Client {
 	t.Helper()
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true}

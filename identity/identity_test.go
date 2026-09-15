@@ -10,7 +10,6 @@ import (
 	"github.com/praetor-auth/praetor-core/internal/devca"
 )
 
-// The identity is read from the URI SAN, not the subject or a hostname.
 func TestSPIFFEIDComesFromTheURISAN(t *testing.T) {
 	_, svid := newCAAndSVID(t, "corp.example", "/ns/prod/sa/orders")
 
@@ -23,9 +22,6 @@ func TestSPIFFEIDComesFromTheURISAN(t *testing.T) {
 	}
 }
 
-// Zero SPIFFE IDs names nobody, two names several with no rule for picking,
-// and a non-SPIFFE URI is not an identity at all. Guessing here would mean
-// guessing who the caller is, so all three are refused.
 func TestMalformedCertificatesAreRefused(t *testing.T) {
 	malformed := map[string][]*url.URL{
 		"no URI SAN":      nil,
@@ -62,8 +58,6 @@ func TestStaticSourceServesTheCurrentSVID(t *testing.T) {
 	}
 }
 
-// A caller must not be able to edit our trust anchors by holding onto the
-// slice we handed back.
 func TestTrustBundleIsCopiedNotShared(t *testing.T) {
 	ca, svid := newCAAndSVID(t, "corp.example", "/ns/prod/sa/orders")
 	source, err := identity.NewStaticSource(svid.Chain, svid.Key, ca.TrustBundle())
@@ -111,8 +105,6 @@ func TestRotateSwapsTheSVIDAndAnnouncesIt(t *testing.T) {
 	}
 }
 
-// A certificate for a different identity is not a rotation. Accepting one
-// would let this process quietly start impersonating another workload.
 func TestRotateRefusesADifferentIdentity(t *testing.T) {
 	ca, svid := newCAAndSVID(t, "corp.example", "/ns/prod/sa/orders")
 	source, err := identity.NewStaticSource(svid.Chain, svid.Key, ca.TrustBundle())
