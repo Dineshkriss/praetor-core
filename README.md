@@ -19,15 +19,20 @@ implemented here.
 ## Try it
 
 ```
-go test ./...       # unit tests
-go run ./cmd/demo   # one service, four calls: one allowed, three blocked
+go run ./cmd/demo   # issue identities for two services and print them
+go test -v ./...    # prove the enforcement works
 ```
 
-The demo brings up a service and shows a valid caller getting through, then a
-caller with no certificate, a caller signed by an untrusted CA, and a caller
-that reached the wrong service all being refused. Every rejection is a real TLS
-failure, and the demo exits non-zero if any call does the opposite of what it
-claims.
+The demo makes a workload identity concrete: two sample services, their SPIFFE
+IDs, and the certificates behind them. Note that the identity read from the
+`Source` and the URI SAN read off the certificate are the same string, and that
+the subject is empty, which is why hostname verification is the wrong check for
+an SVID.
+
+The tests are where the behaviour is proven: a caller with no certificate, a
+caller signed by an untrusted CA, and a caller that reached the wrong service
+are each refused, and calls keep working across an SVID rotation. Every
+rejection is a real TLS handshake failure, not a mock.
 
 ## Using it
 

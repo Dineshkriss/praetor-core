@@ -41,10 +41,10 @@ transport/    turning that identity into mutual TLS
   transport.go  server and client TLS config, peer identity, HTTP helpers
 
 internal/devca/  a stand-in CA so tests and the demo run without SPIRE
-cmd/demo/        four calls against one service: one allowed, three blocked
+cmd/demo/        prints the identities of two sample services
 ```
 
-About 670 lines of Go, plus a 200 line demo and 350 lines of tests. The
+About 690 lines of Go, plus an 80 line demo and 370 lines of tests. The
 dependency list is one entry, `go-spiffe`, and it is used only by `spire.go`.
 Everything else is the standard library, which keeps the trust decisions in code
 that can be read in an afternoon.
@@ -174,8 +174,8 @@ would check the chain against a `ClientCAs` pool captured when the config was
 built. The trust bundle can change while the process runs, so we verify by hand
 in `VerifyPeerCertificate` against roots read at handshake time. `RequireAny`
 still guarantees a certificate is presented; it just hands us the verification
-instead of doing a stale version of it. Demo case 2 shows a caller with no
-certificate being rejected by this setting.
+instead of doing a stale version of it.
+`TestCallerWithoutCertificateIsRejected` exercises this setting.
 
 **Client side sets `InsecureSkipVerify: true`.** This is the line that most
 needs justification in a review, and it is not a weakening. An SVID carries no
@@ -184,10 +184,10 @@ always fail, and even if it passed it would be checking the wrong property:
 "does the name I dialled match the certificate" rather than "is this the
 workload I meant". The flag disables only the built-in hostname and chain check,
 and `VerifyPeerCertificate` then runs unconditionally and does more: full chain
-validation against the live bundle, plus an exact SPIFFE ID match. Demo case 4
-shows the result. The gateway reaches a completely valid, fully trusted service
-and still refuses to send the request, because it is not the service it asked
-for.
+validation against the live bundle, plus an exact SPIFFE ID match.
+`TestClientRejectsTheWrongServerIdentity` shows the result: the client reaches a
+completely valid, fully trusted service and still refuses to send the request,
+because it is not the service it asked for.
 
 **Authorization is a one-line seam.** `transport.Authorizer` is
 `func(peerID string) error`. Today it is `AllowAnyTrustedPeer` or `AllowOnly`.
@@ -209,30 +209,62 @@ of serving anonymous traffic.
 
 ## 7. What the demo shows
 
-`go run ./cmd/demo` starts one orders service and makes four calls:
+`go run ./cmd/demo` issues identities for two sample services and prints them.
+It makes no network calls. Its only job is to make a workload identity concrete,
+because "SVID" on a slide is abstract until you see one.
 
-| # | Call | Result | What it proves |
-| --- | --- | --- | --- |
-| 1 | Gateway to orders, both hold valid SVIDs | Allowed | The happy path works, and the handler learns the caller's identity from the connection |
-| 2 | Caller presents no certificate | Blocked | An unauthenticated process inside the network cannot reach the handler |
-| 3 | Caller's SVID is signed by an untrusted CA | Blocked | A well-formed certificate with a valid SPIFFE ID is still useless without the right issuer |
-| 4 | Gateway expects payments but reaches orders | Blocked | Naming the callee stops a trusted but unintended peer from receiving the request |
+```
+trust domain : corp.example
+trust bundle : 1 CA certificate(s), subject "corp.example dev CA"
 
-Case 3 is the one to point at. The rogue certificate parses cleanly and carries
-a syntactically valid SPIFFE ID for the same path. It fails on one thing only:
-the chain does not terminate in our bundle.
+gateway
+  identity   : spiffe://corp.example/ns/prod/sa/gateway   (Source.SPIFFEID)
+  URI SAN    : spiffe://corp.example/ns/prod/sa/gateway   (read back off the certificate)
+  subject    : ""   (empty: identity does not live here)
+  issuer     : corp.example dev CA
+  serial     : e8e4e733da520693619bee2077dc6aa0
+  key        : ECDSA
+  signature  : ECDSA-SHA256
+  valid for  : 1h0m0s (until 2026-09-15T08:04:26Z)
+  usable as  : [server client]
+```
 
-Every rejection is a real TLS handshake failure. The demo prints the server's
-own handshake error log next to the client's error, and it exits non-zero if any
-call does the opposite of what it claims, so it cannot narrate a result it did
-not produce.
+Three things to point at:
 
-## 8. Tests
+- The **identity** and the **URI SAN** are the same string. The first comes from
+  `Source.SPIFFEID()`, the second is read straight off the certificate. That is
+  the whole of `SPIFFEIDOf`: the identity is not configured anywhere, it is read
+  from the credential.
+- The **subject** is empty. A conventional TLS certificate puts the name there.
+  An SVID does not, which is why hostname verification is the wrong check.
+- The lifetime is **one hour**, matching the SPIRE default, and both services
+  are usable as client and server, because each is a caller on one connection
+  and a callee on the next.
 
-`go test ./...` covers: SPIFFE ID extraction including the three malformed-
-certificate cases, the `Static` source and its rotation rules, a full mutual TLS
-round trip, the three rejection paths above, and a request succeeding after a
-rotation. The suite is race clean.
+## 8. Tests: where the behaviour is actually proven
+
+The demo shows what an identity looks like. The test suite is what shows the
+enforcement works. `go test ./...` covers:
+
+| Test | What it proves |
+| --- | --- |
+| `TestMutualTLSRoundTrip` | The happy path works and the handler learns the caller's identity from the connection |
+| `TestCallerWithoutCertificateIsRejected` | An unauthenticated process on the network cannot reach a handler |
+| `TestCallerFromUntrustedCAIsRejected` | A well-formed certificate with a valid SPIFFE ID is useless without the right issuer |
+| `TestClientRejectsTheWrongServerIdentity` | Naming the callee stops a trusted but unintended peer receiving the request |
+| `TestCallsSurviveAnSVIDRotation` | Rotation does not break in-flight service |
+| `TestMalformedCertificatesAreRefused` | Zero, two, or non-SPIFFE URI SANs are all refused rather than guessed at |
+| `TestTrustBundleIsCopiedNotShared` | A caller cannot edit our trust anchors |
+| `TestRotateRefusesADifferentIdentity` | A rotation cannot quietly change who this process claims to be |
+
+`TestCallerFromUntrustedCAIsRejected` is the one to point at in a review. The
+rogue certificate parses cleanly and claims the same SPIFFE ID as a real
+service. It fails on one thing only: the chain does not terminate in our trust
+bundle.
+
+Every rejection in those tests is a real TLS handshake failure, not a mocked
+one. Run `go test -v ./...` to read them off one by one. The suite is race
+clean.
 
 ## 9. Honest status
 
